@@ -533,4 +533,4 @@ msgstr "Habilitar usuario por defecto"
 #: /resources/lib/lists/skinusers.py
 msgctxt "#32098"
 msgid "Disable default user"
-msgstr "Desabilitar usuario por defecto"
+msgstr "Deshabilitar usuario por defecto"
