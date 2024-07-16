@@ -2,13 +2,12 @@
 # Module: default
 # Author: jurialmunkey
 # License: GPL v.3 https://www.gnu.org/copyleft/gpl.html
-import operator
 from xbmcgui import ListItem, Dialog
 from infotagger.listitem import ListItemInfoTag
-from jurialmunkey.parser import split_items
 from jurialmunkey.litems import Container
 from jurialmunkey.window import set_to_windowprop, WindowProperty
 from resources.lib.kodiutils import kodi_log, get_localized
+from resources.lib.filters import get_filters, is_excluded
 import jurialmunkey.thread as jurialmunkey_thread
 
 
@@ -118,51 +117,6 @@ INFOPROPERTY_MAP = {
     "setid": "set.dbid",
     "songvideourl": "songvideourl",
 }
-
-
-def is_excluded(item, filter_key=None, filter_value=None, filter_operator=None, exclude_key=None, exclude_value=None, exclude_operator=None):
-    """ Checks if item should be excluded based on filter/exclude values
-    Values can optional be a dict which contains module, method, and kwargs
-    """
-    def is_filtered(d, k, v, exclude=False, operator_type=None):
-        comp = getattr(operator, operator_type or 'contains')
-        boolean = False if exclude else True  # Flip values if we want to exclude instead of include
-        if k and v and k in d and comp(str(d[k]).lower(), str(v).lower()):
-            boolean = exclude
-        return boolean
-
-    if not item:
-        return
-
-    il, ip = item.get('infolabels', {}), item.get('infoproperties', {})
-
-    if filter_key and filter_value:
-        _exclude = True
-        for fv in split_items(filter_value):
-            _exclude = True
-            if filter_key in il:
-                _exclude = False
-                if is_filtered(il, filter_key, fv, operator_type=filter_operator):
-                    _exclude = True
-                    continue
-            if filter_key in ip:
-                _exclude = False
-                if is_filtered(ip, filter_key, fv, operator_type=filter_operator):
-                    _exclude = True
-                    continue
-            if not _exclude:
-                break
-        if _exclude:
-            return True
-
-    if exclude_key and exclude_value:
-        for ev in split_items(exclude_value):
-            if exclude_key in il:
-                if is_filtered(il, exclude_key, ev, True, operator_type=exclude_operator):
-                    return True
-            if exclude_key in ip:
-                if is_filtered(ip, exclude_key, ev, True, operator_type=exclude_operator):
-                    return True
 
 
 class MetaItemJSONRPC():
@@ -430,6 +384,13 @@ class MetaFilterDir():
             return
         self.meta['randomise'] = 'true'
 
+    def toggle_fallback(self):
+        from jurialmunkey.parser import boolean
+        if boolean(self.meta.get('fallback', False)):
+            del self.meta['fallback']
+            return
+        self.meta['fallback'] = 'true'
+
     def del_path(self, value):
         x = next(x for x, i in enumerate(self.meta['paths']) if i == value)
         del self.meta['paths'][x]
@@ -484,7 +445,7 @@ class MetaFilterDir():
                 pass
 
     def add_new_filter_operator(self, prefix='filter', suffix=''):
-        choices = [(k, get_localized(v)) for k, v in STANDARD_OPERATORS.items()]
+        choices = [(k, get_localized(v)) for k, v in STANDARD_OPERATORS]
         x = Dialog().select('[CAPITALIZE]{}[/CAPITALIZE] operator'.format(prefix), [i for _, i in choices])
         if x == -1:
             return
@@ -573,6 +534,7 @@ class ListSetFilterDir(Container):
             options = [a for j in (get_path_name_pair(x, i) for x, i in enumerate(meta_filter_dir.meta['paths'])) for a in j]
             options += [f'{k} = {v}' for k, v in meta_filter_dir.meta.items() if k not in ('paths', 'info', 'library', 'names')]
             options += ['randomise = false'] if 'randomise' not in meta_filter_dir.meta.keys() else []
+            options += ['fallback = false'] if 'fallback' not in meta_filter_dir.meta.keys() else []
             options += ['add sort'] if 'sort_by' not in meta_filter_dir.meta.keys() else []
             options += ['add filter', 'add exclude', 'add path', 'rename', 'delete', 'save']
 
@@ -624,6 +586,10 @@ class ListSetFilterDir(Container):
                 meta_filter_dir.toggle_randomise()
                 return do_edit()
 
+            if choice_k == 'fallback':
+                meta_filter_dir.toggle_fallback()
+                return do_edit()
+
             if choice_k == 'add path':
                 meta_filter_dir.add_new_path()
                 return do_edit()
@@ -666,7 +632,7 @@ class ListSetFilterDir(Container):
 
 
 class ListGetFilterDir(Container):
-    def get_directory(self, paths=None, library=None, no_label_dupes=False, dbtype=None, sort_by=None, sort_how=None, randomise=False, names=None, **kwargs):
+    def get_directory(self, paths=None, library=None, no_label_dupes=False, dbtype=None, sort_by=None, sort_how=None, randomise=False, fallback=False, names=None, **kwargs):
         if not paths:
             return
 
@@ -675,24 +641,9 @@ class ListGetFilterDir(Container):
 
         update_global_property_versions()  # Add in any properties added in later JSON-RPC versions
 
-        def _get_filters(filters):
-            all_filters = {}
-            filter_name = ['filter_key', 'filter_value', 'filter_operator', 'exclude_key', 'exclude_value', 'exclude_operator']
-
-            for k, v in filters.items():
-                key, num = k, '0'
-                if '__' in k:
-                    key, num = k.split('__', 1)
-                if key not in filter_name:
-                    continue
-                dic = all_filters.setdefault(num, {})
-                dic[key] = v
-
-            return all_filters
-
         mediatypes = {}
         added_items = []
-        all_filters = _get_filters(kwargs)
+        all_filters = get_filters(**kwargs)
         directory_properties = DIRECTORY_PROPERTIES_BASIC
         directory_properties += {
             'video': DIRECTORY_PROPERTIES_VIDEO,
@@ -737,28 +688,49 @@ class ListGetFilterDir(Container):
                 x = 0  # We want empty values to come last when sorting in descending order (reversed)
             return (x, v)  # Sorted will sort by first value in tuple, then second order afterwards
 
-        def _get_path_name(x):
+        def _get_indexed_path(x=0):
+            seed_paths = [paths.pop(x)]
             try:
-                return names[x]
+                seed_names = [names.pop(x)]
             except (IndexError, TypeError):
-                return ''
+                seed_names = None
+            return (seed_paths, seed_names)
 
-        if boolean(randomise):
+        def _get_random_path():
             import random
             x = random.choice(range(len(paths)))
-            paths = [paths[x]]
-            try:
-                names = [names[x]]
-            except (IndexError, TypeError):
-                names = None
+            return _get_indexed_path(x)
 
-        items = []
-        for x, path in enumerate(paths):
-            path_name = _get_path_name(x)
-            directory = get_directory(path, directory_properties)
-            with ParallelThread(directory, _make_item, path_name) as pt:
-                item_queue = pt.queue
-            items += [i for i in item_queue if i and (not no_label_dupes or _is_not_dupe(i))]
+        def _get_paths_names_tuple():
+            if not paths or len(paths) < 1:
+                return (None, None)
+            if boolean(randomise):
+                return _get_random_path()
+            if boolean(fallback):
+                return _get_indexed_path(0)
+            return (paths, names)
+
+        def _get_items_from_paths():
+            items = []
+            seed_paths, seed_names = _get_paths_names_tuple()
+
+            for x, path in enumerate(seed_paths):
+                try:
+                    path_name = seed_names[x]
+                except (IndexError, TypeError):
+                    path_name = ''
+                directory = get_directory(path, directory_properties)
+                with ParallelThread(directory, _make_item, path_name) as pt:
+                    item_queue = pt.queue
+                items += [i for i in item_queue if i and (not no_label_dupes or _is_not_dupe(i))]
+
+            if not items and len(paths) > 0:
+                if boolean(randomise) or boolean(fallback):
+                    return _get_items_from_paths()
+
+            return items
+
+        items = _get_items_from_paths()
 
         items = sorted(items, key=_get_sorting, reverse=sort_how == 'desc') if sort_by else items
         items = [(i.path, i.listitem, i.is_folder, ) for i in items if i]
